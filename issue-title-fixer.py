@@ -1,186 +1,192 @@
-// src/title-fixer.js
-const fs = require('fs');
-const path = require('path');
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+标题自动补全与层级修正模块（组员2）
+功能：
+  - 解析 Markdown 标题（# 层级）
+  - 统一 # 后空格
+  - 修复跳级标题（如 # 后直接 ### → 补为 ##）
+  - 若文档无一级标题，在开头补充根标题
+  - 生成修改前后对比数据，供日志模块调用
 
-/**
- * 解析 Markdown 文本，提取所有标题及其行号、层级
- * @param {string} text - 原始 Markdown 文本
- * @returns {Array} 标题对象数组 [{ line, level, raw, text }]
- */
-function parseHeadings(text) {
-  const lines = text.split('\n');
-  const headings = [];
-  lines.forEach((line, index) => {
-    const match = line.match(/^(#{1,6})\s+(.*)/);
-    if (match) {
-      headings.push({
-        line: index,
-        level: match[1].length,
-        raw: line,
-        text: match[2].trim()
-      });
+本文件为单文件版本，包含所有代码及内置测试。
+运行 python issue-title-fixer.py 即可执行自测。
+"""
+
+import re
+from typing import List, Dict, Any
+
+
+def parse_headings(text: str) -> List[Dict[str, Any]]:
+    """解析 Markdown 文本，提取所有标题及其行号、层级、内容"""
+    lines = text.splitlines()
+    headings = []
+    for idx, line in enumerate(lines):
+        match = re.match(r'^(#{1,6})\s+(.*)', line)
+        if match:
+            headings.append({
+                'line': idx,
+                'level': len(match.group(1)),
+                'raw': line,
+                'text': match.group(2).strip()
+            })
+    return headings
+
+
+def fix_headings(text: str, default_title: str = "文档标题") -> Dict[str, Any]:
+    """
+    修正标题层级和空格，补充根标题
+    返回: {'fixed_text': str, 'changes': list}
+    """
+    lines = text.splitlines()
+    changes = []
+
+    # ---------- 第1步：统一 # 后空格 ----------
+    space_pattern = re.compile(r'^(#{1,6})(\s*)(.*)')
+    new_lines = []
+    for idx, line in enumerate(lines):
+        m = space_pattern.match(line)
+        if m:
+            hashes, spaces, content = m.groups()
+            content = content.strip()
+            corrected = f"{hashes} {content}"
+            if line != corrected:
+                changes.append({
+                    'line': idx,
+                    'original': line,
+                    'fixed': corrected,
+                    'type': 'fix-space'
+                })
+                new_lines.append(corrected)
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+
+    # ---------- 第2步：修复跳级标题 ----------
+    headings = parse_headings('\n'.join(new_lines))
+    prev_level = 0
+    level_map = {}  # 行号 -> 修正后的级别
+    for h in headings:
+        expected = prev_level + 1
+        if h['level'] > expected and prev_level > 0:
+            level_map[h['line']] = expected
+            prev_level = expected
+        else:
+            prev_level = h['level']
+
+    final_lines = new_lines[:]
+    for line_idx, new_level in level_map.items():
+        old_line = final_lines[line_idx]
+        content = re.sub(r'^#{1,6}\s*', '', old_line).strip()
+        corrected = '#' * new_level + ' ' + content
+        final_lines[line_idx] = corrected
+        changes.append({
+            'line': line_idx,
+            'original': old_line,
+            'fixed': corrected,
+            'type': 'fix-level'
+        })
+
+    # ---------- 第3步：补充根标题（若没有一级标题） ----------
+    final_headings = parse_headings('\n'.join(final_lines))
+    has_h1 = any(h['level'] == 1 for h in final_headings)
+    if not has_h1:
+        insert_line = f"# {default_title}"
+        final_lines.insert(0, insert_line)
+        changes.append({
+            'line': 0,
+            'original': "(无一级标题)",
+            'fixed': insert_line,
+            'type': 'add-root'
+        })
+
+    return {
+        'fixed_text': '\n'.join(final_lines),
+        'changes': changes
     }
-  });
-  return headings;
-}
 
-/**
- * 修正标题层级：修复跳级、统一 # 后空格、补充根标题
- * @param {string} text - 原始 Markdown 文本
- * @param {string} [defaultTitle] - 若文档无一级标题，用作根标题
- * @returns {Object} { fixedText, changes }
- *   changes: [{ line, original, fixed, type }]
- */
-function fixHeadings(text, defaultTitle = '文档标题') {
-  const lines = text.split('\n');
-  const headings = parseHeadings(text);
-  const changes = [];
-  let newLines = [...lines];
 
-  // 1. 如果没有一级标题，在文档开头插入一个
-  const hasH1 = headings.some(h => h.level === 1);
-  if (!hasH1) {
-    const insertLine = `# ${defaultTitle}`;
-    newLines.unshift(insertLine);
-    changes.push({
-      line: 0,
-      original: '(无一级标题)',
-      fixed: insertLine,
-      type: 'add-root'
-    });
-    // 重新解析以更新后续行号
-    // 但为了简化，我们后续使用修正后的 lines 再次修正
-    // 这里采用重新处理：递归调用一次，但避免死循环，我们直接重新解析新文本
-    // 更好的方式：重新运行整个函数，但为了避免无限，我们只处理一次根标题，后面再处理跳级
-    // 我们在此处只添加根标题，跳级等后续处理
-    // 为了方便，将 newLines 重新组合，再次调用 fixHeadings 但跳过根标题添加？
-    // 简单起见，我们把根标题添加后，重新解析并继续。
-    // 但因为我们直接修改了 newLines，需要重新计算 headings 和后续修正，
-    // 所以这里采用重新构建整个文本，递归调用一次（但只加根标题）
-    // 更稳健：先处理跳级，再处理根标题，但跳级依赖原始 headings。
-    // 为了清晰，我们先把根标题加上去，然后重新处理整个文本（但可能重复加根标题）
-    // 所以用标志控制。
-    // 这里我采用先处理跳级，再处理根标题，但跳级时若没有一级可能出错，所以我们先添加根标题。
-    // 所以上面的方法是对的，但需要重新解析新文本。
-    // 我们直接重新调用 fixHeadings 但传入新的文本，但避免递归，我们在此处执行一次。
-    // 我们做一个内部函数 _fix。
-    // 为了干净，我们重构：
-    // 其实更好的做法：先把根标题补上，然后对整体做跳级修正。
-    // 所以我们可以：先补根标题，然后重新解析，再处理跳级。
-    // 这里采用分两步：先补根标题，获得新文本，再对全部修正。
-    // 为保持函数单一，我们直接调用自身，但用标志防止无限。
-    // 更简单：将补根标题放在外部，这里只做跳级和空格。
-    // 我们按职责分离：主函数只做跳级和空格，补根标题单独一个函数。
-    // 所以我重构：fixHeadings只做跳级和空格，补根标题由外部或一个单独方法。
-    // 但任务要求补充根标题，所以我们合并。
-    // 解决：我们直接在主函数内处理，但使用一个标记，如果已补过根标题，则不再重复。
-    // 我们增加一个参数 _skipRoot 内部使用。
-  }
-
-  // 统一 # 后空格（并修复跳级）
-  // 先处理空格：确保 # 后有一个空格
-  const headingRegex = /^(#{1,6})(\s*)(.*)/;
-  const newLinesFixed = newLines.map((line, idx) => {
-    const match = line.match(headingRegex);
-    if (match) {
-      const hashes = match[1];
-      const spaces = match[2];
-      const content = match[3].trim();
-      const correctedLine = `${hashes} ${content}`;
-      if (line !== correctedLine) {
-        changes.push({
-          line: idx,
-          original: line,
-          fixed: correctedLine,
-          type: 'fix-space'
-        });
-        return correctedLine;
-      }
-      return line;
+def generate_diff(original: str, fixed: str, changes: List[Dict]) -> Dict[str, Any]:
+    """生成修改前后对比数据（供日志模块调用）"""
+    return {
+        'original': original,
+        'fixed': fixed,
+        'diff': [
+            {
+                'line': c['line'],
+                'type': c['type'],
+                'before': c['original'],
+                'after': c['fixed']
+            }
+            for c in changes
+        ]
     }
-    return line;
-  });
 
-  // 重新解析新文本的标题
-  const newHeadings = parseHeadings(newLinesFixed.join('\n'));
-  // 修复跳级：从一级开始，若下一级比上一级+1大，则补充中间级别
-  // 我们按顺序处理，维护上一个有效级别
-  let prevLevel = 0;
-  const levelMap = {}; // 记录每一行需要修正的级别
-  newHeadings.forEach((h, index) => {
-    let expectedLevel = prevLevel + 1;
-    // 如果当前级别 <= 上一级，则保持（允许同级或下降）
-    if (h.level > expectedLevel && prevLevel > 0) {
-      // 跳级，需要修正为 expectedLevel
-      levelMap[h.line] = expectedLevel;
-      // 更新 prevLevel 为 expectedLevel（因为修正后级别变了）
-      // 但是这里我们只是标记，后面统一修正，但 prevLevel 应跟随修正后的级别
-      // 但因为后续标题基于当前标题的修正级别，我们动态调整 prevLevel
-      prevLevel = expectedLevel;
-    } else {
-      prevLevel = h.level;
-    }
-  });
 
-  // 应用跳级修正
-  const finalLines = newLinesFixed.map((line, idx) => {
-    if (levelMap[idx] !== undefined) {
-      const newLevel = levelMap[idx];
-      const content = line.replace(/^#{1,6}\s*/, '').trim();
-      const fixed = '#'.repeat(newLevel) + ' ' + content;
-      changes.push({
-        line: idx,
-        original: line,
-        fixed: fixed,
-        type: 'fix-level'
-      });
-      return fixed;
-    }
-    return line;
-  });
+# ---------- 内置自测（运行该文件时自动执行） ----------
+def _run_tests():
+    """运行所有单元测试，使用断言验证"""
+    print("=== 运行标题修正模块自测 ===\n")
 
-  // 最后再次检查并添加根标题（如果还没有一级标题）
-  const finalHeadings = parseHeadings(finalLines.join('\n'));
-  const hasFinalH1 = finalHeadings.some(h => h.level === 1);
-  if (!hasFinalH1) {
-    const insertLine = `# ${defaultTitle}`;
-    finalLines.unshift(insertLine);
-    changes.push({
-      line: 0,
-      original: '(无一级标题)',
-      fixed: insertLine,
-      type: 'add-root'
-    });
-  }
+    # 测试1：解析标题
+    text = "# 一\n## 二\n### 三"
+    hs = parse_headings(text)
+    assert len(hs) == 3
+    assert hs[0]['level'] == 1
+    assert hs[1]['level'] == 2
+    assert hs[2]['level'] == 3
+    print("✅ 测试1 解析标题通过")
 
-  return {
-    fixedText: finalLines.join('\n'),
-    changes: changes
-  };
-}
+    # 测试2：统一空格
+    result = fix_headings("#一级\n##  二级")
+    assert result['fixed_text'] == "# 一级\n## 二级"
+    assert any(c['type'] == 'fix-space' for c in result['changes'])
+    print("✅ 测试2 统一空格通过")
 
-/**
- * 生成修改前后对比数据（供日志模块调用）
- * @param {string} originalText
- * @param {string} fixedText
- * @param {Array} changes - 来自 fixHeadings 的 changes
- * @returns {Object} { original, fixed, diff }
- */
-function generateDiff(originalText, fixedText, changes) {
-  return {
-    original: originalText,
-    fixed: fixedText,
-    diff: changes.map(c => ({
-      line: c.line,
-      type: c.type,
-      before: c.original,
-      after: c.fixed
-    }))
-  };
-}
+    # 测试3：修复跳级
+    result = fix_headings("# 一\n### 三（跳级）")
+    expected = "# 一\n## 三（跳级）"
+    assert result['fixed_text'] == expected
+    assert any(c['type'] == 'fix-level' for c in result['changes'])
+    print("✅ 测试3 修复跳级通过")
 
-module.exports = {
-  parseHeadings,
-  fixHeadings,
-  generateDiff
-};
+    # 测试4：补充根标题
+    result = fix_headings("## 没有根标题")
+    assert result['fixed_text'].startswith("# 文档标题")
+    assert any(c['type'] == 'add-root' for c in result['changes'])
+    print("✅ 测试4 补充根标题通过")
+
+    # 测试5：综合场景
+    raw = "## 二级\n# 一级\n#### 四级"
+    result = fix_headings(raw, "根")
+    expected = "# 根\n## 二级\n# 一级\n## 四级"
+    assert result['fixed_text'] == expected
+    print("✅ 测试5 综合场景通过")
+
+    # 测试6：生成差异数据
+    orig = "# 旧"
+    result = fix_headings(orig, "新根")
+    diff = generate_diff(orig, result['fixed_text'], result['changes'])
+    assert 'original' in diff and 'fixed' in diff and 'diff' in diff
+    assert len(diff['diff']) > 0
+    print("✅ 测试6 差异生成通过")
+
+    print("\n🎉 所有测试通过！")
+
+
+if __name__ == '__main__':
+    # 运行自测
+    _run_tests()
+
+    # 额外演示：打印一个示例修正结果
+    print("\n--- 演示示例 ---")
+    sample = "## 二级（无根）\n### 三级跳级\n# 一级"
+    result = fix_headings(sample, "项目根标题")
+    print("原始文本：")
+    print(sample)
+    print("\n修正后文本：")
+    print(result['fixed_text'])
+    print("\n修改记录：")
+    for c in result['changes']:
+        print(f"  行{c['line']} [{c['type']}]: {c['original']} -> {c['fixed']}")
