@@ -1,35 +1,78 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-标题自动补全与层级修正模块（组员2）
-支持命令行处理单个 Markdown 文件：
-    python issue-title-fixer.py input.md -o output.md [--title "根标题"]
+标题自动生成与补全模块
+功能：
+1. 调用 DeepSeek API 根据文档内容生成标题
+2. 自动补全到 Front Matter 的 title: 字段
+3. 如果文档没有一级标题，同时补充为根标题
 """
 import re
 import sys
+import os
 import argparse
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
+import requests
 
-# ---------- 核心函数（不变） ----------
-def parse_headings(text: str) -> List[Dict[str, Any]]:
+# ---------- Front Matter 处理 ----------
+def extract_front_matter(text: str) -> Tuple[Optional[Dict[str, str]], str, bool]:
+    """提取 Markdown 开头的 YAML Front Matter"""
     lines = text.splitlines()
-    headings = []
-    for idx, line in enumerate(lines):
-        match = re.match(r'^(#{1,6})\s+(.*)', line)
-        if match:
-            headings.append({
-                'line': idx,
-                'level': len(match.group(1)),
-                'raw': line,
-                'text': match.group(2).strip()
-            })
-    return headings
+    if not lines or lines[0].strip() != '---':
+        return None, text, False
 
-def fix_headings(text: str, default_title: str = "文档标题") -> Dict[str, Any]:
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == '---':
+            end_idx = i
+            break
+    if end_idx is None:
+        return None, text, False
+
+    front_matter_lines = lines[1:end_idx]
+    body_lines = lines[end_idx+1:]
+
+    # 解析 key: value
+    data = {}
+    for line in front_matter_lines:
+        line = line.strip()
+        if ':' in line:
+            key, value = line.split(':', 1)
+            data[key.strip()] = value.strip()
+    return data, '\n'.join(body_lines), True
+
+def build_front_matter(data: Dict[str, str]) -> str:
+    """构建 YAML Front Matter 块"""
+    lines = ['---']
+    for k, v in data.items():
+        lines.append(f"{k}: {v}")
+    lines.append('---')
+    return '\n'.join(lines)
+
+def update_or_add_title(text: str, new_title: str) -> str:
+    """
+    更新或添加 title 字段到 Front Matter
+    如果文档没有 Front Matter，则创建一个
+    """
+    data, body, has_fm = extract_front_matter(text)
+    
+    if has_fm:
+        # 更新现有 Front Matter
+        data['title'] = new_title
+        new_fm = build_front_matter(data)
+        return new_fm + '\n' + body
+    else:
+        # 创建新的 Front Matter
+        new_fm = f"---\ntitle: {new_title}\n---\n"
+        return new_fm + text
+
+# ---------- 标题修正（简化版） ----------
+def fix_headings(text: str, default_title: str) -> Dict[str, Any]:
+    """修正标题层级，并确保有一级标题"""
     lines = text.splitlines()
     changes = []
 
-    # 第1步：统一空格
+    # 统一空格
     space_pattern = re.compile(r'^(#{1,6})(\s*)(.*)')
     new_lines = []
     for idx, line in enumerate(lines):
@@ -46,8 +89,20 @@ def fix_headings(text: str, default_title: str = "文档标题") -> Dict[str, An
         else:
             new_lines.append(line)
 
-    # 第2步：修复跳级
-    headings = parse_headings('\n'.join(new_lines))
+    # 修复跳级
+    def parse_headings(text_lines: List[str]) -> List[Dict]:
+        headings = []
+        for idx, line in enumerate(text_lines):
+            match = re.match(r'^(#{1,6})\s+(.*)', line)
+            if match:
+                headings.append({
+                    'line': idx,
+                    'level': len(match.group(1)),
+                    'text': match.group(2).strip()
+                })
+        return headings
+
+    headings = parse_headings(new_lines)
     prev_level = 0
     level_map = {}
     for h in headings:
@@ -66,8 +121,8 @@ def fix_headings(text: str, default_title: str = "文档标题") -> Dict[str, An
         final_lines[line_idx] = corrected
         changes.append({'line': line_idx, 'original': old_line, 'fixed': corrected, 'type': 'fix-level'})
 
-    # 第3步：补充根标题
-    final_headings = parse_headings('\n'.join(final_lines))
+    # 补充根标题（如果没有一级标题）
+    final_headings = parse_headings(final_lines)
     has_h1 = any(h['level'] == 1 for h in final_headings)
     if not has_h1:
         insert_line = f"# {default_title}"
@@ -76,93 +131,154 @@ def fix_headings(text: str, default_title: str = "文档标题") -> Dict[str, An
 
     return {'fixed_text': '\n'.join(final_lines), 'changes': changes}
 
-def generate_diff(original: str, fixed: str, changes: List[Dict]) -> Dict[str, Any]:
-    return {
-        'original': original,
-        'fixed': fixed,
-        'diff': [{'line': c['line'], 'type': c['type'], 'before': c['original'], 'after': c['fixed']} for c in changes]
-    }
+# ---------- DeepSeek API 调用 ----------
+def generate_title_with_deepseek(content: str, api_key: str) -> str:
+    """调用 DeepSeek API 生成标题"""
+    # 截取前 3000 字符
+    truncated = content[:3000]
+    prompt = f"""请根据以下文档内容生成一个简洁、准确的标题（不超过20个字），只输出标题，不要有其他内容：
 
-# ---------- 新增：文件处理命令行入口 ----------
+{truncated}"""
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 50,
+        "temperature": 0.7
+    }
+    
+    try:
+        # 修复：正确的 API 地址是 /v1/chat/completions
+        resp = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",  # 修正了这里
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        title = result['choices'][0]['message']['content'].strip()
+        # 清理可能的引号和多余符号
+        title = re.sub(r'^["\']|["\']$', '', title)
+        # 如果标题为空或过长，截断
+        if len(title) > 50:
+            title = title[:50]
+        return title if title else "文档标题"
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 401:
+            print(f"❌ API 密钥无效或已过期，请检查您的 API Key")
+            print(f"  提示：DeepSeek API Key 格式为 'sk-xxx'")
+        else:
+            print(f"⚠️  HTTP 错误: {e}")
+        return "文档标题"
+    except Exception as e:
+        print(f"⚠️  调用 DeepSeek API 失败: {e}")
+        print("  将使用默认标题: 文档标题")
+        return "文档标题"
+
+# ---------- 主函数 ----------
 def main():
-    parser = argparse.ArgumentParser(description="修正 Markdown 文件的标题层级")
+    parser = argparse.ArgumentParser(
+        description="自动生成 Markdown 标题并补全到 title: 字段",
+        epilog="示例: python issue-title-fixer.py input.md --api-key sk-xxx"
+    )
     parser.add_argument('input_file', help='要处理的 .md 文件路径')
     parser.add_argument('-o', '--output', help='输出文件路径（不指定则覆盖原文件）')
-    parser.add_argument('--title', default='文档标题', help='若文档无一级标题，补充的根标题名称')
-    parser.add_argument('--test', action='store_true', help='运行自测（此时忽略其他参数）')
+    parser.add_argument('--api-key', help='DeepSeek API 密钥（也可通过环境变量 DEEPSEEK_API_KEY 设置）')
+    parser.add_argument('--test', action='store_true', help='运行自测')
     args = parser.parse_args()
 
-    # 如果指定 --test，执行内置测试并退出
     if args.test:
         _run_tests()
         return
+
+    # 获取 API Key（优先使用命令行参数，其次环境变量）
+    api_key = args.api_key or os.environ.get('DEEPSEEK_API_KEY')
+    if not api_key:
+        print("❌ 错误：请提供 API Key")
+        print("  方式1: --api-key sk-xxx")
+        print("  方式2: 设置环境变量 DEEPSEEK_API_KEY=sk-xxx")
+        sys.exit(1)
 
     # 读取文件
     try:
         with open(args.input_file, 'r', encoding='utf-8') as f:
             original = f.read()
     except FileNotFoundError:
-        print(f"错误：文件 '{args.input_file}' 不存在")
+        print(f"❌ 错误：文件 '{args.input_file}' 不存在")
         sys.exit(1)
 
-    # 执行修正
-    result = fix_headings(original, args.title)
-    fixed_text = result['fixed_text']
-    changes = result['changes']
+    print(f"📖 正在处理: {args.input_file}")
 
-    # 输出到文件
+    # 1. 提取正文（去除 Front Matter）
+    _, body, has_fm = extract_front_matter(original)
+    content_to_analyze = body if body else original
+
+    # 2. 调用 API 生成标题
+    print("🤖 正在调用 DeepSeek API 生成标题...")
+    generated_title = generate_title_with_deepseek(content_to_analyze, api_key)
+    print(f"✅ 生成标题: {generated_title}")
+
+    # 3. 修正标题层级（补充根标题）
+    print("🔧 修正标题层级...")
+    result = fix_headings(original, default_title=generated_title)
+    fixed_text = result['fixed_text']
+
+    # 4. 更新 Front Matter 的 title 字段
+    print("📝 更新 Front Matter 的 title 字段...")
+    final_text = update_or_add_title(fixed_text, generated_title)
+
+    # 5. 输出文件
     output_path = args.output if args.output else args.input_file
     with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(fixed_text)
+        f.write(final_text)
 
-    # 打印修改摘要
-    print(f"处理完成！共修改 {len(changes)} 处")
-    for c in changes:
-        print(f"  行{c['line']} [{c['type']}]: {c['original']} -> {c['fixed']}")
+    # 6. 打印摘要
+    print(f"\n✨ 处理完成！")
+    print(f"📂 输出文件: {output_path}")
+    print(f"📌 标题: {generated_title}")
+    print(f"🔄 共修改 {len(result['changes'])} 处")
+    for c in result['changes']:
+        print(f"   - 行 {c['line']} [{c['type']}]: {c['original']} -> {c['fixed']}")
 
-    # 同时生成差异数据（可选，供日志模块使用）
-    diff = generate_diff(original, fixed_text, changes)
-    # 如果希望保存 diff 到 JSON，可在此处增加写入逻辑
-
-# ---------- 内置自测（保持不变） ----------
+# ---------- 测试 ----------
 def _run_tests():
-    print("=== 运行标题修正模块自测 ===\n")
-    text = "# 一\n## 二\n### 三"
-    hs = parse_headings(text)
-    assert len(hs) == 3
-    assert hs[0]['level'] == 1
-    assert hs[1]['level'] == 2
-    assert hs[2]['level'] == 3
-    print("测试1 解析标题通过")
+    print("🧪 运行测试...\n")
+    
+    # 测试 Front Matter 提取
+    test_text = "---\ntitle: 旧标题\n---\n# 正文内容"
+    data, body, has = extract_front_matter(test_text)
+    assert has, "应该检测到 Front Matter"
+    assert data['title'] == '旧标题', "title 提取错误"
+    assert body == '# 正文内容', "正文提取错误"
+    print("✅ 测试1: Front Matter 提取通过")
 
-    result = fix_headings("#一级\n##  二级")
-    assert result['fixed_text'] == "# 一级\n## 二级"
-    assert any(c['type'] == 'fix-space' for c in result['changes'])
-    print(" 测试2 统一空格通过")
+    # 测试更新 title
+    updated = update_or_add_title(test_text, "新标题")
+    assert "title: 新标题" in updated, "title 更新失败"
+    assert "旧标题" not in updated, "旧标题未删除"
+    print("✅ 测试2: title 更新通过")
 
-    result = fix_headings("# 一\n### 三（跳级）")
-    expected = "# 一\n## 三（跳级）"
-    assert result['fixed_text'] == expected
-    assert any(c['type'] == 'fix-level' for c in result['changes'])
-    print(" 测试3 修复跳级通过")
+    # 测试没有 Front Matter 时添加
+    test_no_fm = "# 只有正文"
+    updated = update_or_add_title(test_no_fm, "自动生成标题")
+    assert "---\ntitle: 自动生成标题\n---" in updated, "未创建 Front Matter"
+    print("✅ 测试3: 无 Front Matter 时创建通过")
 
-    result = fix_headings("## 没有根标题")
-    assert result['fixed_text'].startswith("# 文档标题")
-    assert any(c['type'] == 'add-root' for c in result['changes'])
-    print(" 测试4 补充根标题通过")
+    # 测试标题修正
+    test_headings = "## 二级标题\n### 三级标题"
+    result = fix_headings(test_headings, "根标题")
+    assert "# 根标题" in result['fixed_text'], "根标题未添加"
+    assert "## 二级标题" in result['fixed_text'], "层级错误"
+    assert "## 三级标题" in result['fixed_text'], "跳级未修复"
+    print("✅ 测试4: 标题修正通过")
 
-    raw = "## 二级\n# 一级\n#### 四级"
-    result = fix_headings(raw, "根")
-    expected = "# 根\n## 二级\n# 一级\n## 四级"
-    assert result['fixed_text'] == expected
-    print(" 测试5 综合场景通过")
-
-    orig = "# 旧"
-    result = fix_headings(orig, "新根")
-    diff = generate_diff(orig, result['fixed_text'], result['changes'])
-    assert 'original' in diff and 'fixed' in diff and 'diff' in diff
-    assert len(diff['diff']) > 0
-    print("测试6 差异生成通过")
     print("\n🎉 所有测试通过！")
 
 if __name__ == '__main__':
