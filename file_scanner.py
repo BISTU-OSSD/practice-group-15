@@ -11,5 +11,6 @@ def scan_md_files(root_path: str) -> list:
     return md_file_list
 
 if __name__ == "__main__":
-    res = scan_md_files("./docs-demo")
+    target_dir=input("请输入需要扫描的文件夹目录:")
+    res = scan_md_files(target_dir)
     print("扫描到的md文件：", res)
